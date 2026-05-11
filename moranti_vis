@@ -1,0 +1,111 @@
+import xarray as xr
+import numpy as np
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from datetime import datetime
+import pandas as pd  # 用于便捷写入CSV（也可用csv模块）
+
+# 文件路径（请替换为实际路径）
+file_path = "NJIAS_HTCFD-IntID1614-20160912_0230Z.nc"
+
+# 读取数据
+ds = xr.open_dataset(file_path)
+print("文件变量：", list(ds.data_vars))
+
+# 提取经纬度和反照率（以 albedo_03 为例）
+lat = ds['latitude'].values
+lon = ds['longitude'].values
+albedo_var = 'albedo_03'
+albedo = ds[albedo_var].values
+if albedo.ndim == 1:
+    albedo = albedo.reshape(len(lat), len(lon))
+
+# ----- 计算中心 6°×6° 范围（用于绘图和整体校正）-----
+lon_center = (lon.min() + lon.max()) / 2
+lat_center = (lat.min() + lat.max()) / 2
+lon_range_6deg = [lon_center - 3, lon_center + 3]
+lat_range_6deg = [lat_center - 3, lat_center + 3]
+
+lon_mask_6 = (lon >= lon_range_6deg[0]) & (lon <= lon_range_6deg[1])
+lat_mask_6 = (lat >= lat_range_6deg[0]) & (lat <= lat_range_6deg[1])
+lon_cropped = lon[lon_mask_6]
+lat_cropped = lat[lat_mask_6]
+albedo_cropped = albedo[np.ix_(lat_mask_6, lon_mask_6)]
+
+# 观测日期
+obs_date = datetime(2016, 9, 12)
+J = obs_date.timetuple().tm_yday
+delta = 0.4093 * np.sin(2 * np.pi * (J - 80) / 365)
+
+lat_rad = np.radians(lat_cropped)
+cos_theta_noon = np.sin(lat_rad) * np.sin(delta) + np.cos(lat_rad) * np.cos(delta)
+cos_theta_noon = np.clip(cos_theta_noon, 0.01, 1.0)
+cos_theta_grid = np.tile(cos_theta_noon, (len(lon_cropped), 1)).T
+albedo_norm_cropped = albedo_cropped / cos_theta_grid
+
+# ========== 提取中心 1°×1° 区域并保存为 CSV ==========
+lon_range_1deg = [lon_center - 0.5, lon_center + 0.5]
+lat_range_1deg = [lat_center - 0.5, lat_center + 0.5]
+
+# 在裁剪后的网格上查找索引
+lon_mask_1 = (lon_cropped >= lon_range_1deg[0]) & (lon_cropped <= lon_range_1deg[1])
+lat_mask_1 = (lat_cropped >= lat_range_1deg[0]) & (lat_cropped <= lat_range_1deg[1])
+
+# 提取子区域的坐标和值
+lon_1deg_grid, lat_1deg_grid = np.meshgrid(lon_cropped[lon_mask_1], lat_cropped[lat_mask_1])
+albedo_norm_1deg = albedo_norm_cropped[np.ix_(lat_mask_1, lon_mask_1)]
+# 若要同时保存原始反照率（可选）
+albedo_orig_1deg = albedo_cropped[np.ix_(lat_mask_1, lon_mask_1)]
+
+# 展平为一维并创建 DataFrame
+df = pd.DataFrame({
+    'longitude': lon_1deg_grid.flatten(),
+    'latitude': lat_1deg_grid.flatten(),
+    'original_albedo': albedo_orig_1deg.flatten(),
+    'normalized_albedo': albedo_norm_1deg.flatten()
+})
+
+# 保存到 CSV 文件
+csv_filename = 'albedo_1deg_center.csv'
+df.to_csv(csv_filename, index=False)
+print(f"\n中心 1°×1° 区域内数据已保存至: {csv_filename}")
+print(f"包含 {len(df)} 个格点")
+print(df.head())  # 显示前5行
+
+# 同时输出纯向量（仅归一化反照率）到一个单独的文件（可选）
+vector_filename = 'albedo_vector.csv'
+np.savetxt(vector_filename, df['normalized_albedo'].values, 
+           delimiter=',', header='Normalized_Albedo', comments='')
+print(f"归一化反照率向量已保存至: {vector_filename}")
+
+# ========== 绘图（与原代码一致） ==========
+fig, axes = plt.subplots(1, 2, figsize=(14, 6),
+                         subplot_kw={'projection': ccrs.PlateCarree()})
+
+ax1 = axes[0]
+im1 = ax1.pcolormesh(lon_cropped, lat_cropped, albedo_cropped,
+                     cmap='gray', vmin=0, vmax=1, shading='auto',
+                     transform=ccrs.PlateCarree())
+ax1.set_extent(lon_range_6deg + lat_range_6deg, crs=ccrs.PlateCarree())
+ax1.add_feature(cfeature.COASTLINE, linewidth=0.5)
+ax1.set_title('Original Albedo (6°×6°)')
+cbar1 = plt.colorbar(im1, ax=ax1, orientation='vertical', shrink=0.7)
+cbar1.set_label('Albedo')
+
+ax2 = axes[1]
+im2 = ax2.pcolormesh(lon_cropped, lat_cropped, albedo_norm_cropped,
+                     cmap='gray', vmin=0, vmax=None, shading='auto',
+                     transform=ccrs.PlateCarree())
+ax2.set_extent(lon_range_6deg + lat_range_6deg, crs=ccrs.PlateCarree())
+ax2.add_feature(cfeature.COASTLINE, linewidth=0.5)
+ax2.set_title('Normalized Albedo (values can be >1)')
+cbar2 = plt.colorbar(im2, ax=ax2, orientation='vertical', shrink=0.7)
+cbar2.set_label('Normalized Albedo')
+
+plt.tight_layout()
+plt.show()
+
+# 统计信息
+print(f"\n校正后反照率范围（6°×6°）: [{albedo_norm_cropped.min():.3f}, {albedo_norm_cropped.max():.3f}]")
+print(f"其中大于1的像素占比: {(albedo_norm_cropped > 1).mean()*100:.2f}%")
